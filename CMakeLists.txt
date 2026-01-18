@@ -1,4 +1,5 @@
 cmake_minimum_required(VERSION 3.12)
+
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/src/platform/cmake/")
 
 if(POLICY CMP0025)
@@ -8,6 +9,20 @@ if(POLICY CMP0072)
 	cmake_policy(SET CMP0072 NEW)
 	set(OpenGL_GL_PREFERENCE LEGACY)
 endif()
+
+set(COMPILER_PATH "$ENV{HOME}/compiler/prebuilt/bin")
+set(SYSROOT_PATH "$ENV{HOME}/compiler/prebuilt/sysroot")
+
+set(CMAKE_C_COMPILER ${COMPILER_PATH}/arm-oe-linux-gnueabi-clang)
+set(CMAKE_CXX_COMPILER ${COMPILER_PATH}/arm-oe-linux-gnueabi-clang++)
+
+set(CMAKE_SYSTEM_NAME Linux)
+set(CMAKE_SYSTEM_PROCESSOR arm)
+
+#set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+#set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+#set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+#set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
 
 project(mGBA)
 
@@ -87,6 +102,7 @@ if(NOT LIBMGBA_ONLY)
 	set(USE_EPOXY ON CACHE STRING "Build with libepoxy")
 	set(DISABLE_DEPS OFF CACHE BOOL "Build without dependencies")
 	set(DISTBUILD OFF CACHE BOOL "Build distribution packages")
+	set(BUILD_VECTOR OFF CACHE BOOL "Build vector frontend")
 	if(WIN32)
 		set(WIN32_UNIX_PATHS OFF CACHE BOOL "Use Unix-like paths")
 		mark_as_advanced(WIN32_UNIX_PATHS)
@@ -108,7 +124,12 @@ endif()
 
 file(GLOB THIRD_PARTY_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/third-party/inih/*.c)
 set(CORE_VFS_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/util/vfs/vfs-mem.c ${CMAKE_CURRENT_SOURCE_DIR}/src/util/vfs/vfs-fifo.c)
-set(VFS_SRC)
+set(VFS_SRC
+		src/platform/vector/main.c
+		src/platform/vector/video.c
+		src/platform/vector/video.h
+        src/platform/vector/audio.c
+        src/platform/vector/audio.h)
 include_directories(BEFORE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_BINARY_DIR}/include)
 
 if(NOT CMAKE_BUILD_TYPE)
@@ -1068,6 +1089,10 @@ endif()
 
 if(BUILD_QT)
 	add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/src/platform/qt ${CMAKE_CURRENT_BINARY_DIR}/qt)
+endif()
+
+if(BUILD_VECTOR)
+	add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/src/platform/vector ${CMAKE_CURRENT_BINARY_DIR}/vector)
 endif()
 
 if(BUILD_HEADLESS)
