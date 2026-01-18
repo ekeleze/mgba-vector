@@ -19,11 +19,6 @@ set(CMAKE_CXX_COMPILER ${COMPILER_PATH}/arm-oe-linux-gnueabi-clang++)
 set(CMAKE_SYSTEM_NAME Linux)
 set(CMAKE_SYSTEM_PROCESSOR arm)
 
-#set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
-#set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
-#set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
-#set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
-
 project(mGBA)
 
 if(NOT DEFINED LIBMGBA_ONLY)
@@ -129,7 +124,8 @@ set(VFS_SRC
 		src/platform/vector/video.c
 		src/platform/vector/video.h
         src/platform/vector/audio.c
-        src/platform/vector/audio.h)
+        src/platform/vector/audio.h
+		src/platform/vector/video.c)
 include_directories(BEFORE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_BINARY_DIR}/include)
 
 if(NOT CMAKE_BUILD_TYPE)

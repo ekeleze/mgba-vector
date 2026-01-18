@@ -8,6 +8,7 @@
 #include <mgba/core/core.h>
 
 void video_init(bool scaled);
-void video_draw(struct mCore* core);
+void video_stop_thread();
+void video_submit_frame(struct mCore* core);
 
 #endif // MGBA_VIDEO_H

@@ -20,6 +20,8 @@ target_compile_options(mgba-vector PRIVATE
         -g
         -Wall
         -mno-unaligned-access
+        -O3
+        -ffast-math
 )
 
 target_compile_definitions(mgba-vector PRIVATE
@@ -35,6 +37,6 @@ target_include_directories(mgba-vector PRIVATE
         ${CMAKE_SOURCE_DIR}/src
 )
 
-target_link_libraries(mgba-vector ${OS_LIB} pthread)
+target_link_libraries(mgba-vector ${OS_LIB} pthread asound)
 
 install(TARGETS mgba-vector DESTINATION bin)

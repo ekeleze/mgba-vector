@@ -2,16 +2,19 @@
 // Created by ekeleze on 1/17/26.
 //
 
+#include "audio.h"
+
+#include <mgba-util/vfs.h>
+#include <mgba/core/config.h>
+#include <mgba/core/core.h>
+#include <mgba/core/log.h>
+#include <mgba/gba/core.h>
+#include <signal.h>
 #include <stdio.h>
 #include <string.h>
-#include <mgba/core/core.h>
-#include <mgba/core/config.h>
-#include <mgba/gba/core.h>
-#include <mgba-util/vfs.h>
-#include <signal.h>
 #include <sys/stat.h>
-#include <unistd.h>
 #include <sys/time.h>
+#include <unistd.h>
 
 #include "video.h"
 
@@ -95,13 +98,15 @@ int main(int argc, char** argv) {
 	mColor* videoBuffer = malloc(width * height * sizeof(mColor));
 	core->setVideoBuffer(core, videoBuffer, width);
 
-	mCoreLoadConfig(core);
-
-	core->reset(core);
-
 	printf("Initializing video...\n");
 	video_init(scaled);
 	printf("Video initialized\n");
+
+	printf("Initializing audio...\n");
+	audio_init(core);
+	printf("Audio initialized\n");
+
+	core->reset(core);
 
 	struct timeval frame_start, frame_end;
 
@@ -111,11 +116,10 @@ int main(int argc, char** argv) {
 		gettimeofday(&frame_start, NULL);
 
 		core->runFrame(core);
-		video_draw(core);
+		video_submit_frame(core);
 
 		gettimeofday(&frame_end, NULL);
-		long elapsed = (frame_end.tv_sec - frame_start.tv_sec) * 1000000 +
-					   (frame_end.tv_usec - frame_start.tv_usec);
+		long elapsed = (frame_end.tv_sec - frame_start.tv_sec) * 1000000 + (frame_end.tv_usec - frame_start.tv_usec);
 
 		long sleep_time = target_frame_time - elapsed;
 		if (sleep_time > 0) {
@@ -125,6 +129,8 @@ int main(int argc, char** argv) {
 
 	printf("\nShutting down...\n");
 
+	audio_deinit();
+	video_stop_thread();
 	core->deinit(core);
 	vf->close(vf);
 	free(videoBuffer);

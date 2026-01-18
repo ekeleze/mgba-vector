@@ -1,5 +1,5 @@
 //
-// Created by ekeleze on 1/17/26.
+// Created by ekeleze on 1/18/26.
 //
 
 #include "video.h"
@@ -15,8 +15,13 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
+#include <arm_neon.h>
 
 #include <mgba/core/core.h>
+
+#include <pthread.h>
+#include <stdatomic.h>
+#include <sched.h>
 
 #define GPIO_LCD_WRX 110
 #define GPIO_LCD_RESET_MIDAS 96
@@ -27,6 +32,17 @@
 
 #define GBA_WIDTH 240
 #define GBA_HEIGHT 160
+
+#define FRAME_PIXELS (160 * 80)
+
+static pthread_t video_thread;
+static atomic_bool video_running = true;
+static atomic_bool frame_pending = false;
+
+static const uint32_t* pending_src;
+static size_t pending_stride;
+
+static pthread_t video_thread;
 
 typedef uint16_t color_t;
 
@@ -69,17 +85,24 @@ static void gpio_write(int pin, int value) {
 }
 
 static void lcd_spi_transfer(int is_cmd, int bytes, const void* data) {
-	const uint8_t* tx_buf = data;
 
 	gpio_write(GPIO_LCD_WRX, is_cmd ? 0 : 1);
 
-	while (bytes > 0) {
-		size_t count = bytes > MAX_TRANSFER ? MAX_TRANSFER : bytes;
-		write(lcd_fd, tx_buf, count);
-		bytes -= count;
-		tx_buf += count;
+	const uint8_t* ptr = data;
+
+	while (bytes) {
+
+		int chunk = bytes > MAX_TRANSFER ? MAX_TRANSFER : bytes;
+
+		ssize_t ret = write(lcd_fd, ptr, chunk);
+
+		if (ret <= 0) break;
+
+		ptr += ret;
+		bytes -= ret;
 	}
 }
+
 
 bool IsVector1() {
 	FILE *fp;
@@ -264,6 +287,183 @@ void MIDAS_Init() {
     printf("MIDAS LCD initialized!\n");
 }
 
+void zero_buffer(void* ptr, size_t size) {
+	uint8_t* p = (uint8_t*)ptr;
+	size_t i = 0;
+
+	uint8x16_t zero = vdupq_n_u8(0);
+
+	// 64 bytes at a time
+	for (; i + 64 <= size; i += 64) {
+		vst1q_u8(p + i, zero);
+		vst1q_u8(p + i + 16, zero);
+		vst1q_u8(p + i + 32, zero);
+		vst1q_u8(p + i + 48, zero);
+	}
+
+	// Cleanup
+	memset(p + i, 0, size - i);
+}
+
+static uint16x4_t convert_color(uint32x4_t pixels) {
+    uint32x4_t b = vshrq_n_u32(pixels, 19);
+    uint32x4_t g = vshrq_n_u32(pixels, 10);
+    uint32x4_t r = vshrq_n_u32(pixels, 3);
+
+    r = vandq_u32(r, vdupq_n_u32(0x1F));
+    g = vandq_u32(g, vdupq_n_u32(0x3F));
+    b = vandq_u32(b, vdupq_n_u32(0x1F));
+
+    uint32x4_t result32 = vorrq_u32(vshlq_n_u32(r, 11),
+                          vorrq_u32(vshlq_n_u32(g, 5), b));
+
+    return vmovn_u32(result32);
+}
+
+void render_crop(const uint32_t* src, uint16_t* dst) {
+    int offset_x = (GBA_WIDTH - screen_width) / 2;
+    int offset_y = (GBA_HEIGHT - screen_height) / 2;
+
+    for (int y = 0; y < screen_height; y++) {
+        const uint32_t* src_row = &src[(y + offset_y) * GBA_WIDTH + offset_x];
+        uint16_t* dst_row = &dst[y * screen_width];
+
+        int x = 0;
+        for (; x <= screen_width - 4; x += 4) {
+            uint32x4_t pixels = vld1q_u32(&src_row[x]);
+            uint16x4_t result = convert_color(pixels);
+            vst1_u16(&dst_row[x], result);
+        }
+
+        for (; x < screen_width; x++) {
+            uint32_t pixel = src_row[x];
+            uint8_t r = (pixel >> 19) & 0x1F;
+            uint8_t g = (pixel >> 10) & 0x3F;
+            uint8_t b = (pixel >> 3) & 0x1F;
+            dst_row[x] = (r << 11) | (g << 5) | b;
+        }
+    }
+}
+
+void render_scaled(const uint32_t* src, uint16_t* dst) {
+    float x_ratio = (float)GBA_WIDTH / screen_width;
+    float y_ratio = (float)GBA_HEIGHT / screen_height;
+
+    for (int y = 0; y < screen_height; y++) {
+        int src_y = (int)(y * y_ratio);
+        const uint32_t* src_row = &src[src_y * GBA_WIDTH];
+        uint16_t* dst_row = &dst[y * screen_width];
+
+        int x = 0;
+        for (; x <= screen_width - 4; x += 4) {
+            uint32_t p[4];
+            for (int i = 0; i < 4; i++) {
+                int src_x = (int)((x + i) * x_ratio);
+                p[i] = src_row[src_x];
+            }
+
+            uint32x4_t pixels = vld1q_u32(p);
+            uint16x4_t result = convert_color(pixels);
+            vst1_u16(&dst_row[x], result);
+        }
+
+        for (; x < screen_width; x++) {
+            int src_x = (int)(x * x_ratio);
+            uint32_t pixel = src_row[src_x];
+            uint8_t r = (pixel >> 19) & 0x1F;
+            uint8_t g = (pixel >> 10) & 0x3F;
+            uint8_t b = (pixel >> 3) & 0x1F;
+            dst_row[x] = (r << 11) | (g << 5) | b;
+        }
+    }
+}
+
+void render_integer2x(const uint32_t* src, uint16_t* dst) {
+	int scaled_width = GBA_WIDTH / 2;   // 120
+	int scaled_height = GBA_HEIGHT / 2; // 80
+	int offset_x = (screen_width - scaled_width) / 2;
+
+	for (int y = 0; y < scaled_height; y++) {
+		int src_y = y * 2;
+		const uint32_t* src_row = &src[src_y * GBA_WIDTH];
+		uint16_t* dst_row = &dst[y * screen_width + offset_x];
+
+		int x = 0;
+		for (; x <= scaled_width - 4; x += 4) {
+			uint32_t p[4];
+			for (int i = 0; i < 4; i++) {
+				p[i] = src_row[(x + i) * 2];
+			}
+
+			uint32x4_t pixels = vld1q_u32(p);
+			uint16x4_t converted = convert_color(pixels);
+
+			uint16x4_t result = vorr_u16(vshr_n_u16(converted, 8), vshl_n_u16(converted, 8));
+
+			vst1_u16(&dst_row[x], result);
+		}
+
+		for (; x < scaled_width; x++) {
+			int src_x = x * 2;
+			uint32_t pixel = src_row[src_x];
+			uint8_t r = (pixel >> 19) & 0x1F;
+			uint8_t g = (pixel >> 10) & 0x3F;
+			uint8_t b = (pixel >> 3) & 0x1F;
+			uint16_t c = (r << 11) | (g << 5) | b;
+			dst_row[x] = (c >> 8) | (c << 8);
+		}
+	}
+}
+
+static void* video_thread_func(void* arg) {
+	uint16_t video_framebuffer[framebuffer_size];
+
+	static const uint8_t WRITE_RAM = 0x2C;
+
+	while (video_running) {
+
+		if (!atomic_load(&frame_pending)) {
+			sched_yield();
+			continue;
+		}
+
+		atomic_store(&frame_pending, false);
+
+		const uint32_t* src = pending_src;
+
+		if (!v1)
+			render_integer2x(src, video_framebuffer);
+		else if (isScaled)
+			render_scaled(src, video_framebuffer);
+		else
+			render_crop(src, video_framebuffer);
+
+		lcd_spi_transfer(1, 1, &WRITE_RAM);
+
+		lcd_spi_transfer(0,
+			framebuffer_size * sizeof(uint16_t),
+			video_framebuffer);
+	}
+
+	return NULL;
+}
+
+void video_start_thread() {
+
+	pthread_attr_t attr;
+	pthread_attr_init(&attr);
+
+	struct sched_param param = { .sched_priority = 60 };
+
+	pthread_attr_setschedpolicy(&attr, SCHED_FIFO);
+	pthread_attr_setschedparam(&attr, &param);
+
+	pthread_create(&video_thread, &attr,
+					video_thread_func, NULL);
+
+	pthread_attr_destroy(&attr);
+}
+
 void video_init(bool scaled) {
 	isScaled = scaled;
 	v1 = IsVector1();
@@ -273,80 +473,26 @@ void video_init(bool scaled) {
 	} else {
 		MIDAS_Init();
 	}
+
+	video_start_thread();
 }
 
-void render_crop(const color_t* src, color_t* dst) {
-	int offset_x = (GBA_WIDTH - screen_width) / 2;
-	int offset_y = (GBA_HEIGHT - screen_height) / 2;
+void video_stop_thread() {
 
-	for (int y = 0; y < screen_height; y++) {
-		memcpy(&dst[y * screen_width],
-			   &src[(y + offset_y) * GBA_WIDTH + offset_x],
-			   screen_width * sizeof(color_t));
-	}
+	video_running = false;
+
+	pthread_join(video_thread, NULL);
 }
 
-void render_scaled(const color_t* src, color_t* dst) {
-	float x_ratio = (float)GBA_WIDTH / screen_width;
-	float y_ratio = (float)GBA_HEIGHT / screen_height;
-
-	for (int y = 0; y < screen_height; y++) {
-		for (int x = 0; x < screen_width; x++) {
-			int src_x = (int)(x * x_ratio);
-			int src_y = (int)(y * y_ratio);
-			dst[y * screen_width + x] = src[src_y * GBA_WIDTH + src_x];
-		}
-	}
-}
-
-void render_integer2x(const color_t* src, color_t* dst) {
-	memset(dst, 0, screen_width * screen_height * sizeof(color_t));
-
-	int scaled_width = GBA_WIDTH / 2;   // 120
-	int scaled_height = GBA_HEIGHT / 2; // 80
-	int offset_x = (screen_width - scaled_width) / 2;
-
-	for (int y = 0; y < scaled_height; y++) {
-		for (int x = 0; x < scaled_width; x++) {
-			int src_x = x * 2;
-			int src_y = y * 2;
-
-			color_t c = src[src_y * GBA_WIDTH + src_x];
-
-			dst[y * screen_width + x + offset_x] = (c >> 8) | (c << 8);
-		}
-	}
-}
-
-void video_draw(struct mCore* core) {
-	color_t vFrame[framebuffer_size];
-	memset(vFrame, 0, sizeof(vFrame));
+void video_submit_frame(struct mCore* core) {
 
 	const void* buffer;
 	size_t stride;
 
 	core->getPixels(core, &buffer, &stride);
 
-	const uint32_t* frame32 = buffer;
+	pending_src = buffer;
+	pending_stride = stride;
 
-	color_t frame[GBA_WIDTH * GBA_HEIGHT];
-
-	for (int i = 0; i < GBA_WIDTH * GBA_HEIGHT; i++) {
-		uint32_t pixel = frame32[i];
-		uint8_t r = (pixel >> 19) & 0x1F;
-		uint8_t g = (pixel >> 10) & 0x3F;
-		uint8_t b = (pixel >> 3) & 0x1F;
-		frame[i] = (r << 11) | (g << 5) | b;
-	}
-
-	if (!v1)
-		render_integer2x(frame, vFrame);
-	else if (isScaled)
-		render_scaled(frame, vFrame);
-	else
-		render_crop(frame, vFrame);
-
-	static const uint8_t WRITE_RAM = 0x2C;
-	lcd_spi_transfer(1, 1, &WRITE_RAM);
-	lcd_spi_transfer(0, sizeof(vFrame), vFrame);
+	atomic_store(&frame_pending, true);
 }
